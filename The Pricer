@@ -1,0 +1,350 @@
+import numpy as np
+from scipy.stats import norm
+import yfinance as yf
+from datetime import datetime, timedelta
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+
+# Configuration de la page
+st.set_page_config(page_title="Pricing Options & Swaps", layout="wide", page_icon="📈")
+
+class BlackScholesOption:
+    """Pricing et Greeks pour options européennes avec Black-Scholes"""
+    
+    def __init__(self, S, K, T, r, sigma, option_type='call'):
+        self.S = S
+        self.K = K
+        self.T = T
+        self.r = r
+        self.sigma = sigma
+        self.option_type = option_type.lower()
+        
+    def d1(self):
+        return (np.log(self.S / self.K) + (self.r + 0.5 * self.sigma**2) * self.T) / (self.sigma * np.sqrt(self.T))
+    
+    def d2(self):
+        return self.d1() - self.sigma * np.sqrt(self.T)
+    
+    def price(self):
+        d1, d2 = self.d1(), self.d2()
+        if self.option_type == 'call':
+            return self.S * norm.cdf(d1) - self.K * np.exp(-self.r * self.T) * norm.cdf(d2)
+        else:
+            return self.K * np.exp(-self.r * self.T) * norm.cdf(-d2) - self.S * norm.cdf(-d1)
+    
+    def delta(self):
+        if self.option_type == 'call':
+            return norm.cdf(self.d1())
+        else:
+            return norm.cdf(self.d1()) - 1
+    
+    def gamma(self):
+        return norm.pdf(self.d1()) / (self.S * self.sigma * np.sqrt(self.T))
+    
+    def vega(self):
+        return self.S * norm.pdf(self.d1()) * np.sqrt(self.T) / 100
+    
+    def theta(self):
+        d1, d2 = self.d1(), self.d2()
+        if self.option_type == 'call':
+            theta = (-self.S * norm.pdf(d1) * self.sigma / (2 * np.sqrt(self.T)) 
+                    - self.r * self.K * np.exp(-self.r * self.T) * norm.cdf(d2))
+        else:
+            theta = (-self.S * norm.pdf(d1) * self.sigma / (2 * np.sqrt(self.T)) 
+                    + self.r * self.K * np.exp(-self.r * self.T) * norm.cdf(-d2))
+        return theta / 365
+    
+    def rho(self):
+        d2 = self.d2()
+        if self.option_type == 'call':
+            return self.K * self.T * np.exp(-self.r * self.T) * norm.cdf(d2) / 100
+        else:
+            return -self.K * self.T * np.exp(-self.r * self.T) * norm.cdf(-d2) / 100
+
+
+class InterestRateSwap:
+    """IRS basique (fixed vs floating)"""
+    
+    def __init__(self, notional, fixed_rate, floating_rate, tenor_years, payment_freq=2):
+        self.notional = notional
+        self.fixed_rate = fixed_rate
+        self.floating_rate = floating_rate
+        self.tenor_years = tenor_years
+        self.payment_freq = payment_freq
+        self.n_payments = int(tenor_years * payment_freq)
+        
+    def fixed_leg_pv(self, discount_rate):
+        dt = 1 / self.payment_freq
+        pv = 0
+        for i in range(1, self.n_payments + 1):
+            t = i * dt
+            df = np.exp(-discount_rate * t)
+            pv += self.notional * self.fixed_rate * dt * df
+        return pv
+    
+    def floating_leg_pv(self, discount_rate):
+        dt = 1 / self.payment_freq
+        pv = 0
+        for i in range(1, self.n_payments + 1):
+            t = i * dt
+            df = np.exp(-discount_rate * t)
+            pv += self.notional * self.floating_rate * dt * df
+        return pv
+    
+    def value(self, discount_rate):
+        return self.floating_leg_pv(discount_rate) - self.fixed_leg_pv(discount_rate)
+    
+    def dv01(self, discount_rate):
+        v0 = self.value(discount_rate)
+        v1 = self.value(discount_rate + 0.0001)
+        return v1 - v0
+
+
+@st.cache_data(ttl=300)
+def get_live_data(ticker='AAPL', lookback_days=252):
+    """Récupère données live et calcule volatilité historique"""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period='1d')
+        spot = hist['Close'].iloc[-1]
+        
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=lookback_days)
+        data = stock.history(start=start_date, end=end_date)
+        
+        returns = np.log(data['Close'] / data['Close'].shift(1))
+        vol = returns.std() * np.sqrt(252)
+        
+        return spot, vol, True
+    except Exception as e:
+        st.error(f"Erreur lors de la récupération des données: {e}")
+        return None, None, False
+
+
+def plot_option_payoff(option, spot_range=None):
+    """Graphique du payoff de l'option"""
+    if spot_range is None:
+        spot_range = np.linspace(option.S * 0.7, option.S * 1.3, 100)
+    
+    prices = []
+    for s in spot_range:
+        opt = BlackScholesOption(s, option.K, option.T, option.r, option.sigma, option.option_type)
+        prices.append(opt.price())
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=spot_range, y=prices, mode='lines', name='Prix option', line=dict(width=3)))
+    fig.add_vline(x=option.S, line_dash="dash", line_color="red", annotation_text="Spot actuel")
+    fig.add_vline(x=option.K, line_dash="dash", line_color="green", annotation_text="Strike")
+    
+    fig.update_layout(
+        title=f"Prix de l'option {option.option_type.upper()} en fonction du spot",
+        xaxis_title="Prix du sous-jacent",
+        yaxis_title="Prix de l'option",
+        height=400
+    )
+    return fig
+
+
+def plot_greeks(option):
+    """Graphique des Greeks"""
+    spot_range = np.linspace(option.S * 0.7, option.S * 1.3, 100)
+    
+    deltas, gammas, vegas = [], [], []
+    for s in spot_range:
+        opt = BlackScholesOption(s, option.K, option.T, option.r, option.sigma, option.option_type)
+        deltas.append(opt.delta())
+        gammas.append(opt.gamma())
+        vegas.append(opt.vega())
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=spot_range, y=deltas, mode='lines', name='Delta'))
+    fig.add_trace(go.Scatter(x=spot_range, y=gammas, mode='lines', name='Gamma', yaxis='y2'))
+    
+    fig.update_layout(
+        title="Greeks: Delta & Gamma",
+        xaxis_title="Prix du sous-jacent",
+        yaxis_title="Delta",
+        yaxis2=dict(title="Gamma", overlaying='y', side='right'),
+        height=400
+    )
+    return fig
+
+
+# Interface Streamlit
+st.title("📈 Pricing d'Options Européennes & Interest Rate Swaps")
+
+tabs = st.tabs(["🎯 Options avec données réelles", "💱 Interest Rate Swap", "⚙️ Options personnalisées"])
+
+# TAB 1: Options avec données réelles
+with tabs[0]:
+    st.header("Options avec données de marché")
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        ticker = st.text_input("Ticker", value="AAPL", help="Symbole du sous-jacent (ex: AAPL, MSFT, GOOGL)")
+        
+        if st.button("📊 Récupérer les données", type="primary"):
+            with st.spinner("Chargement des données..."):
+                spot, hist_vol, success = get_live_data(ticker)
+                
+                if success:
+                    st.session_state['spot'] = spot
+                    st.session_state['hist_vol'] = hist_vol
+                    st.success(f"✓ Données récupérées pour {ticker}")
+    
+    if 'spot' in st.session_state:
+        spot = st.session_state['spot']
+        hist_vol = st.session_state['hist_vol']
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Prix Spot", f"${spot:.2f}")
+        col2.metric("Volatilité historique", f"{hist_vol*100:.2f}%")
+        col3.metric("Ticker", ticker)
+        
+        st.divider()
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📞 Call Option")
+            strike_call = st.slider("Strike (% du spot)", 80, 120, 100, key="strike_call") / 100 * spot
+            maturity_call = st.slider("Maturité (mois)", 1, 24, 3, key="mat_call") / 12
+            rate_call = st.slider("Taux sans risque (%)", 0.0, 10.0, 4.5, 0.1, key="rate_call") / 100
+            
+            call = BlackScholesOption(spot, strike_call, maturity_call, rate_call, hist_vol, 'call')
+            
+            st.metric("💰 Prix du Call", f"${call.price():.4f}")
+            
+            greeks_call = pd.DataFrame({
+                'Greek': ['Delta', 'Gamma', 'Vega', 'Theta', 'Rho'],
+                'Valeur': [
+                    f"{call.delta():.4f}",
+                    f"{call.gamma():.6f}",
+                    f"${call.vega():.4f}",
+                    f"${call.theta():.4f}",
+                    f"${call.rho():.4f}"
+                ]
+            })
+            st.dataframe(greeks_call, use_container_width=True, hide_index=True)
+            
+            st.plotly_chart(plot_option_payoff(call), use_container_width=True)
+        
+        with col2:
+            st.subheader("📉 Put Option")
+            strike_put = st.slider("Strike (% du spot)", 80, 120, 95, key="strike_put") / 100 * spot
+            maturity_put = st.slider("Maturité (mois)", 1, 24, 6, key="mat_put") / 12
+            rate_put = st.slider("Taux sans risque (%)", 0.0, 10.0, 4.5, 0.1, key="rate_put") / 100
+            
+            put = BlackScholesOption(spot, strike_put, maturity_put, rate_put, hist_vol, 'put')
+            
+            st.metric("💰 Prix du Put", f"${put.price():.4f}")
+            
+            greeks_put = pd.DataFrame({
+                'Greek': ['Delta', 'Gamma', 'Vega', 'Theta', 'Rho'],
+                'Valeur': [
+                    f"{put.delta():.4f}",
+                    f"{put.gamma():.6f}",
+                    f"${put.vega():.4f}",
+                    f"${put.theta():.4f}",
+                    f"${put.rho():.4f}"
+                ]
+            })
+            st.dataframe(greeks_put, use_container_width=True, hide_index=True)
+            
+            st.plotly_chart(plot_option_payoff(put), use_container_width=True)
+
+# TAB 2: Interest Rate Swap
+with tabs[1]:
+    st.header("Interest Rate Swap")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        notional = st.number_input("Notionnel ($)", value=10_000_000, step=1_000_000)
+        fixed_rate = st.slider("Taux fixe (%)", 0.0, 10.0, 4.0, 0.1) / 100
+        floating_rate = st.slider("Taux flottant (%)", 0.0, 10.0, 4.5, 0.1) / 100
+    
+    with col2:
+        tenor = st.slider("Durée (années)", 1, 30, 5)
+        payment_freq = st.selectbox("Fréquence de paiement", [1, 2, 4, 12], index=1, 
+                                    format_func=lambda x: {1: "Annuel", 2: "Semestriel", 4: "Trimestriel", 12: "Mensuel"}[x])
+        discount_rate = st.slider("Taux d'actualisation (%)", 0.0, 10.0, 4.5, 0.1) / 100
+    
+    swap = InterestRateSwap(notional, fixed_rate, floating_rate, tenor, payment_freq)
+    
+    st.divider()
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Valeur du Swap", f"${swap.value(discount_rate):,.2f}")
+    col2.metric("DV01", f"${swap.dv01(discount_rate):,.2f}")
+    col3.metric("Jambe fixe PV", f"${swap.fixed_leg_pv(discount_rate):,.2f}")
+    
+    st.subheader("📊 Analyse de scénarios")
+    
+    scenarios_data = []
+    for bp_change in [-50, -25, -10, 0, 10, 25, 50]:
+        new_rate = discount_rate + bp_change / 10000
+        value = swap.value(new_rate)
+        scenarios_data.append({
+            'Scénario': f"{bp_change:+d} bp",
+            'Taux': f"{new_rate*100:.3f}%",
+            'Valeur': value,
+            'Δ vs Base': value - swap.value(discount_rate)
+        })
+    
+    df_scenarios = pd.DataFrame(scenarios_data)
+    st.dataframe(df_scenarios.style.format({
+        'Valeur': '${:,.2f}',
+        'Δ vs Base': '${:+,.2f}'
+    }), use_container_width=True, hide_index=True)
+
+# TAB 3: Options personnalisées
+with tabs[2]:
+    st.header("Options avec paramètres personnalisés")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        custom_spot = st.number_input("Prix Spot", value=100.0, step=1.0)
+        custom_strike = st.number_input("Strike", value=100.0, step=1.0)
+        custom_maturity = st.slider("Maturité (années)", 0.01, 5.0, 0.25, 0.01)
+    
+    with col2:
+        custom_rate = st.slider("Taux sans risque (%)", 0.0, 20.0, 5.0, 0.1) / 100
+        custom_vol = st.slider("Volatilité (%)", 1.0, 100.0, 25.0, 1.0) / 100
+        custom_type = st.radio("Type d'option", ["Call", "Put"])
+    
+    custom_option = BlackScholesOption(custom_spot, custom_strike, custom_maturity, 
+                                       custom_rate, custom_vol, custom_type.lower())
+    
+    st.divider()
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("💰 Prix de l'option", f"${custom_option.price():.4f}")
+    col2.metric("📊 Moneyness", f"{(custom_spot/custom_strike - 1)*100:+.2f}%")
+    col3.metric("⏱️ Jours restants", f"{int(custom_maturity * 365)}")
+    
+    st.subheader("Greeks")
+    greeks_df = pd.DataFrame({
+        'Greek': ['Delta', 'Gamma', 'Vega', 'Theta', 'Rho'],
+        'Valeur': [
+            custom_option.delta(),
+            custom_option.gamma(),
+            custom_option.vega(),
+            custom_option.theta(),
+            custom_option.rho()
+        ],
+        'Interprétation': [
+            'Sensibilité à +$1 du spot',
+            'Sensibilité du Delta',
+            'Sensibilité à +1% de vol',
+            'Decay par jour',
+            'Sensibilité à +1% de taux'
+        ]
+    })AS
+    st.dataframe(greeks_df.style.format({'Valeur': '{:.6f}'}), use_container_width=True, hide_index=True)
+    
+    st.plotly_chart(plot_option_payoff(custom_option), use_container_width=True)
+    st.plotly_chart(plot_greeks(custom_option), use_container_width=True)
