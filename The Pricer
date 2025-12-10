@@ -343,7 +343,7 @@ with tabs[2]:
             'Decay par jour',
             'Sensibilité à +1% de taux'
         ]
-    })AS
+    })
     st.dataframe(greeks_df.style.format({'Valeur': '{:.6f}'}), use_container_width=True, hide_index=True)
     
     st.plotly_chart(plot_option_payoff(custom_option), use_container_width=True)
